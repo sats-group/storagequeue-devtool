@@ -38,7 +38,10 @@ static async Task<int> HandleDequeue(DequeueOptions options)
             Console.Write(options.ColumnSeparator);
             Console.Write(peeked.InsertedOn);
             Console.Write(options.Separator);
-            await queue.DeleteMessageAsync(peeked.MessageId, peeked.PopReceipt, cancellationToken: cts.Token);
+            if (!options.PeekOnly)
+            {
+                await queue.DeleteMessageAsync(peeked.MessageId, peeked.PopReceipt, cancellationToken: cts.Token);
+            }
         }
 
         response = await queue.ReceiveMessagesAsync(maxMessages: 32, cancellationToken: cts.Token);
@@ -69,6 +72,12 @@ static async Task<int> HandleSummary(SummaryOptions options)
 
 static async Task<int> HandleAdd(AddOptions addOptions)
 {
+    if (addOptions.ColumnSeparator is not null && addOptions.ColumnSelector is null)
+    {
+        Console.Error.WriteLine("ColumnSelector is necessary when ColumnSeparator is set.");
+        return 1;
+    }
+
     await using var stdErr = Console.OpenStandardError();
     await using var stdErrWriter = new StreamWriter(stdErr);
     await stdErrWriter.WriteLineAsync(addOptions.DestinationQueueName);
@@ -97,21 +106,29 @@ static async Task<int> HandleAdd(AddOptions addOptions)
     await using var stdIn = Console.OpenStandardInput();
     using var reader = new StreamReader(stdIn, Encoding.UTF8);
     int count = 0;
-    await foreach (var line in ReadUntil(reader, "||", cts.Token))
+    await foreach (var line in ReadUntil(reader, addOptions.Separator, addOptions.ColumnSeparator, cts.Token))
     {
         var visibilityTimeout =
             addOptions.VisibilityTimeout is {} visibilityTimeoutOptions
             ? (TimeSpan?)TimeSpan.FromSeconds(count * visibilityTimeoutOptions)
             : null;
 
-        await queue.SendMessageAsync(line, visibilityTimeout: visibilityTimeout);
+        var data = line[addOptions.ColumnSelector ?? 0];
+        if (addOptions.DryRun)
+        {
+            Console.WriteLine(data);
+        }
+        else
+        {
+            await queue.SendMessageAsync(data, visibilityTimeout: visibilityTimeout);
+        }
 
         count++;
     }
     return 0;
 }
 
-static async IAsyncEnumerable<string> ReadUntil(StreamReader reader, string separator, [EnumeratorCancellation] CancellationToken cancellationToken)
+static async IAsyncEnumerable<string[]> ReadUntil(StreamReader reader, string separator, string? columnSeparator, [EnumeratorCancellation] CancellationToken cancellationToken)
 {
     StringBuilder? current = null;
     while (true)
@@ -121,7 +138,10 @@ static async IAsyncEnumerable<string> ReadUntil(StreamReader reader, string sepa
         {
             if (current is not null)
             {
-                yield return current.ToString();
+                yield return
+                    columnSeparator is not null
+                    ? current.ToString().Split(columnSeparator)
+                    : [current.ToString()];
             }
 
             break;
@@ -145,7 +165,10 @@ static async IAsyncEnumerable<string> ReadUntil(StreamReader reader, string sepa
 
         if (current is not null)
         {
-            yield return current.ToString();
+            yield return
+                columnSeparator is not null
+                ? current.ToString().Split(columnSeparator)
+                : [current.ToString()];
         }
 
         if (string.IsNullOrEmpty(split[1]))
@@ -163,24 +186,17 @@ static async IAsyncEnumerable<string> ReadUntil(StreamReader reader, string sepa
 [Verb("dequeue", HelpText = "dequeue.")]
 class DequeueOptions
 {
-    public DequeueOptions(
-        string queueName,
-        string? separator,
-        string? columnSeparator)
-    {
-        QueueName = queueName;
-        Separator = separator ?? Environment.NewLine;
-        ColumnSeparator = columnSeparator ?? ",";
-    }
-
     [Value(0, MetaName = "queueName", HelpText = "The name of the queue to dequeue.", Required = true)]
-    public string QueueName { get; }
+    public required string QueueName { get; init; }
 
     [Option('s', "separator", HelpText = "This parameter decides how to separate messages (default: new line).", Required = false)]
-    public string Separator { get; }
+    public string Separator { get; init; } = Environment.NewLine;
 
     [Option('c', "column-separator", HelpText = "This parameter decides how to separate columns (default: ,).", Required = false)]
-    public string ColumnSeparator { get; }
+    public string ColumnSeparator { get; init; } = ",";
+
+    [Option('p', "peek-only", HelpText = "This parameter decides if the message will be deleted from the queue (default: false).", Required = false)]
+    public bool PeekOnly { get; init; }
 }
 
 [Verb("summary", HelpText = "dequeue.")]
@@ -198,17 +214,21 @@ class SummaryOptions
 [Verb("add", HelpText = "Adds messages from stdin to a storage queue.")]
 class AddOptions
 {
-    public AddOptions(
-        string destinationQueueName,
-        double? visibilityTimeout)
-    {
-        DestinationQueueName = destinationQueueName;
-        VisibilityTimeout = visibilityTimeout;
-    }
-
     [Value(0, MetaName = "queueName", HelpText = "The name of the queue to which the messages will be added.", Required = true)]
-    public string DestinationQueueName { get; }
+    public required string DestinationQueueName { get; init; }
 
     [Option('t', "visibility-timeout-factor", HelpText = "This parameter decided the visibilityTimeout that is set to each messages passed from stdin, visibilityTimeout = visibility-timeout-factor * msgCount (in seconds).", Required = false)]
-    public double? VisibilityTimeout { get; }
+    public double? VisibilityTimeout { get; init; }
+
+    [Option('s', "separator", HelpText = "This parameter decides how to separate messages (default: new line).", Required = false)]
+    public string Separator { get; init; } = Environment.NewLine;
+
+    [Option("column-separator", HelpText = "This parameter decides how to separate columns (default is 'null' and the line will not be splitted.).", Required = false)]
+    public string? ColumnSeparator { get; init; }
+
+    [Option("column-selector", HelpText = "This parameter decides which columns to send, need if 'column-separator' is _not_ null (default: null).", Required = false)]
+    public int? ColumnSelector { get; init; }
+
+    [Option("dry-run", HelpText = "This parameter decides if the message will be added to the queue or just printed to stdout (default: false).", Required = false)]
+    public bool DryRun { get; init; }
 }
